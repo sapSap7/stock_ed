@@ -129,7 +129,7 @@ def load_stock_cache():
     print(f"Startup: loaded {len(STOCK_CACHE)} stocks.")
 
 
-@app.on_event("startup")
+@app.lifespan("startup")
 async def on_startup():
     await load_etf_cache()
     load_stock_cache()
