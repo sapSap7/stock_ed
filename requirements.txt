@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+pyetfdb-scraper
+yfinance
+pandas
+lxml
+python-dotenv
+openai
