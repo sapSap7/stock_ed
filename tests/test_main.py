@@ -41,24 +41,35 @@ def sample_caches():
 
 
 @pytest.fixture(autouse=True)
-def temp_favourites_db(tmp_path, monkeypatch):
-    """Point favourites/users at a throwaway DB file so tests never touch the real one."""
-    db_path = tmp_path / "test_favourites.db"
-    monkeypatch.setattr(main, "DB_PATH", str(db_path))
+def clean_test_db():
+    """Ensure tables exist, then clean up any test users afterward (their
+    favourites cascade-delete with them). Tests run against the real Postgres
+    DB from DATABASE_URL — every test google_sub below is prefixed 'test-' so
+    this one DELETE clears everything a test could have created.
+    """
     main.init_db()
     yield
+    conn = main.get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM users WHERE google_sub LIKE 'test-%'")
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
 @pytest.fixture
-def auth_headers(temp_favourites_db):
+def auth_headers(clean_test_db):
     """A valid Authorization header for a freshly created test user."""
     conn = main.get_db()
-    conn.execute(
-        "INSERT INTO users (google_sub, email, name, created_at) VALUES (?, ?, ?, ?)",
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO users (google_sub, email, name, created_at) VALUES (%s, %s, %s, %s)",
         ("test-google-sub", "test@example.com", "Test User", "2024-01-01T00:00:00+00:00"),
     )
     conn.commit()
-    user = conn.execute("SELECT * FROM users WHERE google_sub = ?", ("test-google-sub",)).fetchone()
+    cur.execute("SELECT * FROM users WHERE google_sub = %s", ("test-google-sub",))
+    user = cur.fetchone()
+    cur.close()
     conn.close()
 
     token = main.issue_session_token(user["id"])
@@ -236,12 +247,15 @@ def test_favourites_are_scoped_per_user(client, auth_headers):
     client.post("/favourites", json={"ticker": "VNQ", "asset_type": "etf"}, headers=auth_headers)
 
     conn = main.get_db()
-    conn.execute(
-        "INSERT INTO users (google_sub, email, name, created_at) VALUES (?, ?, ?, ?)",
-        ("other-user-sub", "other@example.com", "Other User", "2024-01-01T00:00:00+00:00"),
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO users (google_sub, email, name, created_at) VALUES (%s, %s, %s, %s)",
+        ("test-other-user-sub", "other@example.com", "Other User", "2024-01-01T00:00:00+00:00"),
     )
     conn.commit()
-    other_user = conn.execute("SELECT * FROM users WHERE google_sub = ?", ("other-user-sub",)).fetchone()
+    cur.execute("SELECT * FROM users WHERE google_sub = %s", ("test-other-user-sub",))
+    other_user = cur.fetchone()
+    cur.close()
     conn.close()
     other_headers = {"Authorization": f"Bearer {main.issue_session_token(other_user['id'])}"}
 
@@ -250,7 +264,7 @@ def test_favourites_are_scoped_per_user(client, auth_headers):
 
 
 def test_google_auth_creates_new_user(client):
-    fake_claims = {"sub": "google-123", "email": "new@example.com", "name": "New User"}
+    fake_claims = {"sub": "test-google-123", "email": "new@example.com", "name": "New User"}
     with patch("main.google_id_token.verify_oauth2_token", return_value=fake_claims):
         response = client.post("/auth/google", json={"credential": "fake-token"})
 
@@ -261,7 +275,7 @@ def test_google_auth_creates_new_user(client):
 
 
 def test_google_auth_returns_same_user_on_repeat_login(client):
-    fake_claims = {"sub": "google-123", "email": "repeat@example.com", "name": "Repeat User"}
+    fake_claims = {"sub": "test-google-123", "email": "repeat@example.com", "name": "Repeat User"}
     with patch("main.google_id_token.verify_oauth2_token", return_value=fake_claims):
         first = client.post("/auth/google", json={"credential": "fake-token"}).json()
         second = client.post("/auth/google", json={"credential": "fake-token"}).json()

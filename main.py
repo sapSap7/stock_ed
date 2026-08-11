@@ -30,16 +30,20 @@ Endpoints:
 Auth: requires GOOGLE_CLIENT_ID (from Google Cloud Console) and JWT_SECRET
 (any random string) set in .env.
 
+Database: requires DATABASE_URL (a Postgres connection string, e.g. from
+Neon) set in .env. Used for users/favourites.
+
 Caveat: scraping ETFDB for every ETF at startup can take a while (there are
 thousands of ETFs, one scrape request each). ETF_SCRAPE_LIMIT below caps it
 for local development; remove/raise it for a full run.
 """
 
 import os
-import sqlite3
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 import jwt
+import psycopg2
+import psycopg2.extras
 import requests
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -87,21 +91,21 @@ ETF_SCRAPE_LIMIT = int(os.getenv("ETF_SCRAPE_LIMIT", "200"))
 ETF_CACHE = []
 STOCK_CACHE = []
 
-DB_PATH = os.getenv("FAVOURITES_DB", "favourites.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     return conn
 
 
 def init_db():
     conn = get_db()
-    conn.execute(
+    cur = conn.cursor()
+    cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             google_sub TEXT UNIQUE NOT NULL,
             email TEXT NOT NULL,
             name TEXT,
@@ -109,20 +113,11 @@ def init_db():
         )
         """
     )
-
-    # favourites used to be a single global list (pre-auth); migrate to
-    # per-user by recreating the table if it's still on the old schema.
-    # No production data to preserve at this stage, so a clean recreate
-    # is simplest.
-    columns = {row["name"] for row in conn.execute("PRAGMA table_info(favourites)")}
-    if columns and "user_id" not in columns:
-        conn.execute("DROP TABLE favourites")
-
-    conn.execute(
+    cur.execute(
         """
         CREATE TABLE IF NOT EXISTS favourites (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL REFERENCES users(id),
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             ticker TEXT NOT NULL,
             asset_type TEXT NOT NULL,
             name TEXT,
@@ -132,6 +127,7 @@ def init_db():
         """
     )
     conn.commit()
+    cur.close()
     conn.close()
 
 
@@ -244,16 +240,20 @@ def issue_session_token(user_id: int) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
-def get_or_create_user(google_sub: str, email: str, name: str | None) -> sqlite3.Row:
+def get_or_create_user(google_sub: str, email: str, name: str | None) -> dict:
     conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE google_sub = ?", (google_sub,)).fetchone()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE google_sub = %s", (google_sub,))
+    user = cur.fetchone()
     if user is None:
-        conn.execute(
-            "INSERT INTO users (google_sub, email, name, created_at) VALUES (?, ?, ?, ?)",
+        cur.execute(
+            "INSERT INTO users (google_sub, email, name, created_at) VALUES (%s, %s, %s, %s)",
             (google_sub, email, name, datetime.now(timezone.utc).isoformat()),
         )
         conn.commit()
-        user = conn.execute("SELECT * FROM users WHERE google_sub = ?", (google_sub,)).fetchone()
+        cur.execute("SELECT * FROM users WHERE google_sub = %s", (google_sub,))
+        user = cur.fetchone()
+    cur.close()
     conn.close()
     return user
 
@@ -273,7 +273,7 @@ async def auth_google(payload: GoogleAuthRequest):
     return {"token": token, "user": {"email": user["email"], "name": user["name"]}}
 
 
-def get_current_user(authorization: str = Header(None)) -> sqlite3.Row:
+def get_current_user(authorization: str = Header(None)) -> dict:
     """FastAPI dependency: extracts and validates the session token, returns the user row."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
@@ -285,7 +285,10 @@ def get_current_user(authorization: str = Header(None)) -> sqlite3.Row:
         raise HTTPException(status_code=401, detail="Invalid or expired session token")
 
     conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE id = ?", (payload["user_id"],)).fetchone()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE id = %s", (payload["user_id"],))
+    user = cur.fetchone()
+    cur.close()
     conn.close()
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
@@ -299,39 +302,51 @@ class FavouriteRequest(BaseModel):
 
 
 @app.get("/favourites")
-async def get_favourites(current_user: sqlite3.Row = Depends(get_current_user)):
+async def get_favourites(current_user: dict = Depends(get_current_user)):
     """Return the logged-in user's saved favourites, most recently added first."""
     conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM favourites WHERE user_id = ? ORDER BY added_at DESC",
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM favourites WHERE user_id = %s ORDER BY added_at DESC",
         (current_user["id"],),
-    ).fetchall()
+    )
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
     return [dict(row) for row in rows]
 
 
 @app.post("/favourites")
-async def add_favourite(payload: FavouriteRequest, current_user: sqlite3.Row = Depends(get_current_user)):
+async def add_favourite(payload: FavouriteRequest, current_user: dict = Depends(get_current_user)):
     """Add (or update) a ticker in the logged-in user's favourites."""
     conn = get_db()
-    conn.execute(
-        "INSERT OR REPLACE INTO favourites (user_id, ticker, asset_type, name, added_at) VALUES (?, ?, ?, ?, ?)",
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO favourites (user_id, ticker, asset_type, name, added_at)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (user_id, ticker)
+        DO UPDATE SET asset_type = EXCLUDED.asset_type, name = EXCLUDED.name, added_at = EXCLUDED.added_at
+        """,
         (current_user["id"], payload.ticker.upper(), payload.asset_type, payload.name, datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
+    cur.close()
     conn.close()
     return {"status": "added"}
 
 
 @app.delete("/favourites/{ticker}")
-async def remove_favourite(ticker: str, current_user: sqlite3.Row = Depends(get_current_user)):
+async def remove_favourite(ticker: str, current_user: dict = Depends(get_current_user)):
     """Remove a ticker from the logged-in user's favourites."""
     conn = get_db()
-    conn.execute(
-        "DELETE FROM favourites WHERE ticker = ? AND user_id = ?",
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM favourites WHERE ticker = %s AND user_id = %s",
         (ticker.upper(), current_user["id"]),
     )
     conn.commit()
+    cur.close()
     conn.close()
     return {"status": "removed"}
 

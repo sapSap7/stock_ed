@@ -8,3 +8,4 @@ python-dotenv
 openai
 google-auth
 PyJWT
+psycopg2-binary
