@@ -40,6 +40,31 @@ def sample_caches():
     main.STOCK_CACHE.clear()
 
 
+@pytest.fixture(autouse=True)
+def temp_favourites_db(tmp_path, monkeypatch):
+    """Point favourites/users at a throwaway DB file so tests never touch the real one."""
+    db_path = tmp_path / "test_favourites.db"
+    monkeypatch.setattr(main, "DB_PATH", str(db_path))
+    main.init_db()
+    yield
+
+
+@pytest.fixture
+def auth_headers(temp_favourites_db):
+    """A valid Authorization header for a freshly created test user."""
+    conn = main.get_db()
+    conn.execute(
+        "INSERT INTO users (google_sub, email, name, created_at) VALUES (?, ?, ?, ?)",
+        ("test-google-sub", "test@example.com", "Test User", "2024-01-01T00:00:00+00:00"),
+    )
+    conn.commit()
+    user = conn.execute("SELECT * FROM users WHERE google_sub = ?", ("test-google-sub",)).fetchone()
+    conn.close()
+
+    token = main.issue_session_token(user["id"])
+    return {"Authorization": f"Bearer {token}"}
+
+
 def test_get_etfs_returns_all(client):
     response = client.get("/etfs")
     assert response.status_code == 200
@@ -162,3 +187,181 @@ def test_assistant_upstream_error_returns_500(client):
         response = client.post("/assistant", json={"question": "Hello"})
 
     assert response.status_code == 500
+
+
+def test_favourites_require_auth(client):
+    assert client.get("/favourites").status_code == 401
+    assert client.post("/favourites", json={"ticker": "VNQ", "asset_type": "etf"}).status_code == 401
+    assert client.delete("/favourites/VNQ").status_code == 401
+
+
+def test_favourites_reject_invalid_token(client):
+    response = client.get("/favourites", headers={"Authorization": "Bearer not-a-real-token"})
+    assert response.status_code == 401
+
+
+def test_add_and_get_favourites(client, auth_headers):
+    response = client.post(
+        "/favourites",
+        json={"ticker": "vnq", "asset_type": "etf", "name": "Vanguard Real Estate ETF"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+
+    response = client.get("/favourites", headers=auth_headers)
+    assert response.status_code == 200
+    favourites = response.json()
+    assert len(favourites) == 1
+    assert favourites[0]["ticker"] == "VNQ"
+    assert favourites[0]["asset_type"] == "etf"
+
+
+def test_remove_favourite(client, auth_headers):
+    client.post("/favourites", json={"ticker": "AAPL", "asset_type": "stock"}, headers=auth_headers)
+    response = client.delete("/favourites/aapl", headers=auth_headers)
+    assert response.status_code == 200
+    assert client.get("/favourites", headers=auth_headers).json() == []
+
+
+def test_add_favourite_replaces_existing(client, auth_headers):
+    client.post("/favourites", json={"ticker": "VNQ", "asset_type": "etf", "name": "Old Name"}, headers=auth_headers)
+    client.post("/favourites", json={"ticker": "VNQ", "asset_type": "etf", "name": "New Name"}, headers=auth_headers)
+
+    favourites = client.get("/favourites", headers=auth_headers).json()
+    assert len(favourites) == 1
+    assert favourites[0]["name"] == "New Name"
+
+
+def test_favourites_are_scoped_per_user(client, auth_headers):
+    client.post("/favourites", json={"ticker": "VNQ", "asset_type": "etf"}, headers=auth_headers)
+
+    conn = main.get_db()
+    conn.execute(
+        "INSERT INTO users (google_sub, email, name, created_at) VALUES (?, ?, ?, ?)",
+        ("other-user-sub", "other@example.com", "Other User", "2024-01-01T00:00:00+00:00"),
+    )
+    conn.commit()
+    other_user = conn.execute("SELECT * FROM users WHERE google_sub = ?", ("other-user-sub",)).fetchone()
+    conn.close()
+    other_headers = {"Authorization": f"Bearer {main.issue_session_token(other_user['id'])}"}
+
+    assert client.get("/favourites", headers=other_headers).json() == []
+    assert len(client.get("/favourites", headers=auth_headers).json()) == 1
+
+
+def test_google_auth_creates_new_user(client):
+    fake_claims = {"sub": "google-123", "email": "new@example.com", "name": "New User"}
+    with patch("main.google_id_token.verify_oauth2_token", return_value=fake_claims):
+        response = client.post("/auth/google", json={"credential": "fake-token"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["user"]["email"] == "new@example.com"
+    assert "token" in body
+
+
+def test_google_auth_returns_same_user_on_repeat_login(client):
+    fake_claims = {"sub": "google-123", "email": "repeat@example.com", "name": "Repeat User"}
+    with patch("main.google_id_token.verify_oauth2_token", return_value=fake_claims):
+        first = client.post("/auth/google", json={"credential": "fake-token"}).json()
+        second = client.post("/auth/google", json={"credential": "fake-token"}).json()
+
+    first_headers = {"Authorization": f"Bearer {first['token']}"}
+    second_headers = {"Authorization": f"Bearer {second['token']}"}
+    client.post("/favourites", json={"ticker": "VNQ", "asset_type": "etf"}, headers=first_headers)
+
+    assert len(client.get("/favourites", headers=second_headers).json()) == 1
+
+
+def test_google_auth_rejects_invalid_token(client):
+    with patch("main.google_id_token.verify_oauth2_token", side_effect=ValueError("bad token")):
+        response = client.post("/auth/google", json={"credential": "fake-token"})
+
+    assert response.status_code == 401
+
+
+def test_financial_insight(client):
+    fake_response = MagicMock()
+    fake_response.choices = [MagicMock(message=MagicMock(content="Revenue is growing."))]
+
+    fake_financials = pd.DataFrame(
+        {pd.Timestamp("2024-06-30"): [1000.0], pd.Timestamp("2024-03-31"): [900.0]},
+        index=["Total Revenue"],
+    )
+    mock_ticker = MagicMock()
+    mock_ticker.quarterly_financials = fake_financials
+
+    with patch("main.yf.Ticker", return_value=mock_ticker), \
+         patch("main.openai_client.chat.completions.create", return_value=fake_response) as mock_create:
+        response = client.post("/insight/VNQ")
+
+    assert response.status_code == 200
+    assert response.json()["insight"] == "Revenue is growing."
+    sent_prompt = mock_create.call_args.kwargs["messages"][1]["content"]
+    assert "Total Revenue" in sent_prompt
+
+
+def test_company_analysis(client):
+    fake_response = MagicMock()
+    fake_response.choices = [MagicMock(message=MagicMock(content="This company sells real estate ETFs."))]
+
+    mock_ticker = MagicMock()
+    mock_ticker.info = {"longBusinessSummary": "Vanguard Real Estate ETF tracks US real estate."}
+
+    with patch("main.yf.Ticker", return_value=mock_ticker), \
+         patch("main.openai_client.chat.completions.create", return_value=fake_response):
+        response = client.post("/analysis/VNQ")
+
+    assert response.status_code == 200
+    assert "real estate" in response.json()["analysis"].lower()
+
+
+def test_company_analysis_no_summary_returns_404(client):
+    mock_ticker = MagicMock()
+    mock_ticker.info = {}
+
+    with patch("main.yf.Ticker", return_value=mock_ticker):
+        response = client.post("/analysis/UNKNOWN")
+
+    assert response.status_code == 404
+
+
+def test_weekly_update(client):
+    fake_response = MagicMock()
+    fake_response.choices = [MagicMock(message=MagicMock(content="Stock moved due to earnings."))]
+
+    mock_ticker = MagicMock()
+    mock_ticker.news = [{"title": "Company beats earnings expectations"}]
+
+    with patch("main.yf.Ticker", return_value=mock_ticker), \
+         patch("main.openai_client.chat.completions.create", return_value=fake_response):
+        response = client.post("/weekly-update/VNQ")
+
+    assert response.status_code == 200
+    assert "earnings" in response.json()["update"].lower()
+
+
+def test_weekly_update_no_news_returns_404(client):
+    mock_ticker = MagicMock()
+    mock_ticker.news = []
+
+    with patch("main.yf.Ticker", return_value=mock_ticker):
+        response = client.post("/weekly-update/UNKNOWN")
+
+    assert response.status_code == 404
+
+
+def test_weekly_update_handles_nested_content_format(client):
+    fake_response = MagicMock()
+    fake_response.choices = [MagicMock(message=MagicMock(content="Summary."))]
+
+    mock_ticker = MagicMock()
+    mock_ticker.news = [{"content": {"title": "New product launch announced"}}]
+
+    with patch("main.yf.Ticker", return_value=mock_ticker), \
+         patch("main.openai_client.chat.completions.create", return_value=fake_response) as mock_create:
+        response = client.post("/weekly-update/VNQ")
+
+    assert response.status_code == 200
+    sent_prompt = mock_create.call_args.kwargs["messages"][1]["content"]
+    assert "New product launch announced" in sent_prompt

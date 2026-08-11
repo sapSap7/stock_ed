@@ -6,3 +6,5 @@ pandas
 lxml
 python-dotenv
 openai
+google-auth
+PyJWT

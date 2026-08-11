@@ -1,3 +1,12 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+body {
+  background: #ffffff;
+  margin: 0;
+}
+
+html.dark body {
+  background: #0f172a;
+}

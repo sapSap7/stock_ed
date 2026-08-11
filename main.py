@@ -20,6 +20,15 @@ Endpoints:
 - GET /categories               -> available ETF categories + stock sectors (for a filter dropdown)
 - GET /info/{ticker}            -> detailed info for one ticker (stock or ETF)
 - GET /price/{ticker}?period=1y&interval=1d -> historical price data
+- POST /assistant                -> free-text Q&A, optionally grounded in one ticker
+- POST /auth/google              -> verify a Google ID token, issue our own session token
+- GET/POST/DELETE /favourites     -> saved tickers, per logged-in user (requires Authorization: Bearer <token>)
+- POST /insight/{ticker}         -> AI summary of recent revenue/profit trends
+- POST /analysis/{ticker}        -> AI summary of business model/revenue streams/risks
+- POST /weekly-update/{ticker}   -> AI summary of recent news headlines and likely impact
+
+Auth: requires GOOGLE_CLIENT_ID (from Google Cloud Console) and JWT_SECRET
+(any random string) set in .env.
 
 Caveat: scraping ETFDB for every ETF at startup can take a while (there are
 thousands of ETFs, one scrape request each). ETF_SCRAPE_LIMIT below caps it
@@ -27,11 +36,16 @@ for local development; remove/raise it for a full run.
 """
 
 import os
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from io import StringIO
+import jwt
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token as google_id_token
 from pydantic import BaseModel
 from pyetfdb_scraper.etf import ETF, load_etfs
 import yfinance as yf
@@ -44,6 +58,15 @@ load_dotenv()
 # pointed at Groq's base_url with a Groq API key and model name.
 openai_client = OpenAI(api_key=os.getenv("GROQ_API_KEY"), base_url="https://api.groq.com/openai/v1")
 AI_MODEL = os.getenv("AI_MODEL", "llama-3.1-8b-instant")
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+JWT_SECRET = os.getenv("JWT_SECRET")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRY_HOURS = 24 * 7
+
+if not JWT_SECRET:
+    JWT_SECRET = "dev-secret-change-me"
+    print("WARNING: JWT_SECRET not set in .env — using an insecure dev default. Set a real random value before deploying.")
 
 WIKI_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36"
@@ -63,6 +86,56 @@ ETF_SCRAPE_LIMIT = int(os.getenv("ETF_SCRAPE_LIMIT", "200"))
 # In-memory caches populated at startup
 ETF_CACHE = []
 STOCK_CACHE = []
+
+DB_PATH = os.getenv("FAVOURITES_DB", "favourites.db")
+
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            google_sub TEXT UNIQUE NOT NULL,
+            email TEXT NOT NULL,
+            name TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    # favourites used to be a single global list (pre-auth); migrate to
+    # per-user by recreating the table if it's still on the old schema.
+    # No production data to preserve at this stage, so a clean recreate
+    # is simplest.
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(favourites)")}
+    if columns and "user_id" not in columns:
+        conn.execute("DROP TABLE favourites")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS favourites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            ticker TEXT NOT NULL,
+            asset_type TEXT NOT NULL,
+            name TEXT,
+            added_at TEXT NOT NULL,
+            UNIQUE(user_id, ticker)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+init_db()
 
 
 def extract_etf_category(info: dict) -> str:
@@ -159,6 +232,110 @@ async def get_categories():
     return {"etf_categories": etf_categories, "stock_sectors": stock_sectors}
 
 
+class GoogleAuthRequest(BaseModel):
+    credential: str  # the ID token handed to the frontend by Google's Sign-In button
+
+
+def issue_session_token(user_id: int) -> str:
+    payload = {
+        "user_id": user_id,
+        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def get_or_create_user(google_sub: str, email: str, name: str | None) -> sqlite3.Row:
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE google_sub = ?", (google_sub,)).fetchone()
+    if user is None:
+        conn.execute(
+            "INSERT INTO users (google_sub, email, name, created_at) VALUES (?, ?, ?, ?)",
+            (google_sub, email, name, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        user = conn.execute("SELECT * FROM users WHERE google_sub = ?", (google_sub,)).fetchone()
+    conn.close()
+    return user
+
+
+@app.post("/auth/google")
+async def auth_google(payload: GoogleAuthRequest):
+    """Verify a Google ID token, then issue our own session token for the matching user."""
+    try:
+        claims = google_id_token.verify_oauth2_token(
+            payload.credential, google_requests.Request(), GOOGLE_CLIENT_ID
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid Google token: {e}")
+
+    user = get_or_create_user(claims["sub"], claims["email"], claims.get("name"))
+    token = issue_session_token(user["id"])
+    return {"token": token, "user": {"email": user["email"], "name": user["name"]}}
+
+
+def get_current_user(authorization: str = Header(None)) -> sqlite3.Row:
+    """FastAPI dependency: extracts and validates the session token, returns the user row."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+
+    token = authorization.removeprefix("Bearer ")
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired session token")
+
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE id = ?", (payload["user_id"],)).fetchone()
+    conn.close()
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
+class FavouriteRequest(BaseModel):
+    ticker: str
+    asset_type: str  # "etf" or "stock"
+    name: str | None = None
+
+
+@app.get("/favourites")
+async def get_favourites(current_user: sqlite3.Row = Depends(get_current_user)):
+    """Return the logged-in user's saved favourites, most recently added first."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM favourites WHERE user_id = ? ORDER BY added_at DESC",
+        (current_user["id"],),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+@app.post("/favourites")
+async def add_favourite(payload: FavouriteRequest, current_user: sqlite3.Row = Depends(get_current_user)):
+    """Add (or update) a ticker in the logged-in user's favourites."""
+    conn = get_db()
+    conn.execute(
+        "INSERT OR REPLACE INTO favourites (user_id, ticker, asset_type, name, added_at) VALUES (?, ?, ?, ?, ?)",
+        (current_user["id"], payload.ticker.upper(), payload.asset_type, payload.name, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "added"}
+
+
+@app.delete("/favourites/{ticker}")
+async def remove_favourite(ticker: str, current_user: sqlite3.Row = Depends(get_current_user)):
+    """Remove a ticker from the logged-in user's favourites."""
+    conn = get_db()
+    conn.execute(
+        "DELETE FROM favourites WHERE ticker = ? AND user_id = ?",
+        (ticker.upper(), current_user["id"]),
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "removed"}
+
+
 @app.get("/info/{ticker}")
 async def get_ticker_info(ticker: str):
     """Return live info for one ticker (works for a stock or an ETF)."""
@@ -174,13 +351,74 @@ async def get_ticker_info(ticker: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+NOT_ADVICE_RULE = (
+    "You are not a licensed financial advisor: never tell the user what to buy, sell, "
+    "or how to allocate their money."
+)
+
 ASSISTANT_SYSTEM_PROMPT = (
     "You are a financial education assistant embedded in a stock/ETF tracking app. "
     "Explain financial terms and describe stocks/ETFs in plain, accessible language. "
-    "You are not a licensed financial advisor: never tell the user what to buy, sell, "
-    "or how to allocate their money. Stick to explaining concepts and describing the "
-    "data given to you."
+    f"{NOT_ADVICE_RULE} Stick to explaining concepts and describing the data given to you."
 )
+
+INSIGHT_SYSTEM_PROMPT = (
+    "You are a financial education assistant. Given a company's recent quarterly "
+    "financial statement data, explain in simple, plain-English terms: revenue "
+    f"growth trends, profit trends, and any notable concerns. {NOT_ADVICE_RULE}"
+)
+
+ANALYSIS_SYSTEM_PROMPT = (
+    "You are a financial education assistant. Given a company's business summary, "
+    "explain in simple, plain-English terms: its business model, main revenue "
+    f"streams, key growth drivers, and major risks. {NOT_ADVICE_RULE}"
+)
+
+WEEKLY_UPDATE_SYSTEM_PROMPT = (
+    "You are a financial education assistant. Given a list of recent news headlines "
+    "about a company, summarize what's been happening, why the stock may have moved, "
+    "and the likely short-term vs long-term impact on the business. Only use "
+    f"information from the headlines given; do not invent events. {NOT_ADVICE_RULE}"
+)
+
+
+def call_ai(system_prompt: str, user_prompt: str) -> str:
+    response = openai_client.chat.completions.create(
+        model=AI_MODEL,
+        max_tokens=600,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    return response.choices[0].message.content
+
+
+def format_quarterly_financials(tk) -> str:
+    fin = tk.quarterly_financials
+    if fin is None or fin.empty:
+        return "No financial statement data available."
+
+    lines = []
+    for row_name in ("Total Revenue", "Gross Profit", "Operating Income", "Net Income"):
+        if row_name in fin.index:
+            values = fin.loc[row_name].dropna()
+            formatted = ", ".join(f"{col.strftime('%Y-%m-%d')}: {val:,.0f}" for col, val in values.items())
+            if formatted:
+                lines.append(f"{row_name}: {formatted}")
+
+    return "\n".join(lines) if lines else "No matching financial line items available."
+
+
+def extract_headline(item: dict) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    if item.get("title"):
+        return item["title"]
+    content = item.get("content")
+    if isinstance(content, dict):
+        return content.get("title")
+    return None
 
 
 class AssistantRequest(BaseModel):
@@ -204,15 +442,52 @@ async def ask_assistant(payload: AssistantRequest):
             pass  # fall back to the question alone if the ticker lookup fails
 
     try:
-        response = openai_client.chat.completions.create(
-            model=AI_MODEL,
-            max_tokens=500,
-            messages=[
-                {"role": "system", "content": ASSISTANT_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-        return {"answer": response.choices[0].message.content}
+        return {"answer": call_ai(ASSISTANT_SYSTEM_PROMPT, user_prompt)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/insight/{ticker}")
+async def get_financial_insight(ticker: str):
+    """AI summary of a ticker's recent revenue/profit trends and concerns."""
+    try:
+        tk = yf.Ticker(ticker.upper())
+        financials_text = format_quarterly_financials(tk)
+        user_prompt = f"Ticker: {ticker.upper()}\nRecent quarterly financials:\n{financials_text}"
+        return {"ticker": ticker.upper(), "insight": call_ai(INSIGHT_SYSTEM_PROMPT, user_prompt)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/analysis/{ticker}")
+async def get_company_analysis(ticker: str):
+    """AI analysis of a ticker's business model, revenue streams, growth drivers, and risks."""
+    try:
+        tk = yf.Ticker(ticker.upper())
+        summary = tk.info.get("longBusinessSummary")
+        if not summary:
+            raise HTTPException(status_code=404, detail=f"No business summary available for {ticker}")
+        user_prompt = f"Ticker: {ticker.upper()}\nBusiness summary:\n{summary}"
+        return {"ticker": ticker.upper(), "analysis": call_ai(ANALYSIS_SYSTEM_PROMPT, user_prompt)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/weekly-update/{ticker}")
+async def get_weekly_update(ticker: str):
+    """AI summary of a ticker's recent news headlines: what happened and likely impact."""
+    try:
+        tk = yf.Ticker(ticker.upper())
+        news_items = tk.news or []
+        headlines = [h for item in news_items[:8] if (h := extract_headline(item))]
+        if not headlines:
+            raise HTTPException(status_code=404, detail=f"No recent news found for {ticker}")
+        user_prompt = f"Ticker: {ticker.upper()}\nRecent headlines:\n" + "\n".join(f"- {h}" for h in headlines)
+        return {"ticker": ticker.upper(), "update": call_ai(WEEKLY_UPDATE_SYSTEM_PROMPT, user_prompt)}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
