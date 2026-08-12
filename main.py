@@ -38,6 +38,7 @@ thousands of ETFs, one scrape request each). ETF_SCRAPE_LIMIT below caps it
 for local development; remove/raise it for a full run.
 """
 
+import asyncio
 import os
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -140,7 +141,7 @@ def extract_etf_category(info: dict) -> str:
     return dbtheme.get("category") or dbtheme.get("asset_class") or "Uncategorized"
 
 
-async def load_etf_cache():
+def load_etf_cache():
     print("Startup: loading ETF list from ETFDB (this may take a while)...")
     try:
         tickers = load_etfs()
@@ -198,10 +199,17 @@ def load_stock_cache():
     print(f"Startup: loaded {len(STOCK_CACHE)} stocks.")
 
 
+def populate_caches():
+    load_etf_cache()
+    load_stock_cache()
+
+
 @app.on_event("startup")
 async def on_startup():
-    await load_etf_cache()
-    load_stock_cache()
+    # Run the scrape in a background thread instead of awaiting it here.
+    # Blocking startup on this would keep the port from opening in time for
+    # host platforms (e.g. Render) that expect the process to bind quickly.
+    asyncio.create_task(asyncio.to_thread(populate_caches))
 
 
 @app.get("/etfs")
