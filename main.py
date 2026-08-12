@@ -4,10 +4,13 @@ main.py
 Consolidated FastAPI backend for the stock & ETF tracker.
 
 Data sources:
-- pyetfdb_scraper: full ETF list + per-ETF metadata, used to build category groupings
+- pyetfdb_scraper: just the ETF ticker list (load_etfs()) — per-ETF detail
+  pages on etfdb.com are blocked by Cloudflare from cloud hosting IPs, so
+  they're not used
 - Wikipedia's S&P 500 table (via pandas.read_html): stock list with each company's
   GICS sector/sub-industry already labeled, no per-ticker lookup needed
-- yfinance: live price history + detailed per-ticker info, for both stocks and ETFs
+- yfinance: live price history + detailed per-ticker info (category, name,
+  expense ratio, AUM) for both stocks and ETFs
 
 How to run:
 1. Activate the venv, then: pip install -r requirements.txt
@@ -33,9 +36,10 @@ Auth: requires GOOGLE_CLIENT_ID (from Google Cloud Console) and JWT_SECRET
 Database: requires DATABASE_URL (a Postgres connection string, e.g. from
 Neon) set in .env. Used for users/favourites.
 
-Caveat: scraping ETFDB for every ETF at startup can take a while (there are
-thousands of ETFs, one scrape request each). ETF_SCRAPE_LIMIT below caps it
-for local development; remove/raise it for a full run.
+Caveat: fetching yfinance data for every ETF at startup can take a while
+(there are thousands of ETFs, one request each). ETF_SCRAPE_LIMIT below
+caps it; this population now runs in a background thread so it doesn't
+block the app from accepting requests while it runs.
 """
 
 import asyncio
@@ -52,7 +56,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token as google_id_token
 from pydantic import BaseModel
-from pyetfdb_scraper.etf import ETF, load_etfs
+from pyetfdb_scraper.etf import load_etfs
 import yfinance as yf
 import pandas as pd
 import uvicorn
@@ -135,14 +139,12 @@ def init_db():
 init_db()
 
 
-def extract_etf_category(info: dict) -> str:
-    """Best-effort extraction of a single category label from ETFDB's scraped info."""
-    dbtheme = info.get("dbtheme", {}) or {}
-    return dbtheme.get("category") or dbtheme.get("asset_class") or "Uncategorized"
-
-
 def load_etf_cache():
-    print("Startup: loading ETF list from ETFDB (this may take a while)...")
+    # Ticker list comes from ETFDB (pyetfdb_scraper), which is fine — but
+    # per-ETF detail pages on etfdb.com are blocked by Cloudflare for cloud
+    # hosting IPs (works locally, 403s on Render/etc). yfinance works from
+    # both, so it's used for the actual category/name/expense-ratio data.
+    print("Startup: loading ETF ticker list...")
     try:
         tickers = load_etfs()
     except Exception as e:
@@ -152,17 +154,18 @@ def load_etf_cache():
     found = []
     for t in tickers[:ETF_SCRAPE_LIMIT]:
         try:
-            etf = ETF(t)
-            info = etf.info
+            info = yf.Ticker(t).info
+            category = info.get("category")
+            if not category:
+                continue
             found.append({
                 "ticker": t,
-                "name": info.get("vitals", {}).get("etf_name", ""),
-                "category": extract_etf_category(info),
-                "expense_ratio": info.get("vitals", {}).get("expense_ratio", ""),
-                "aum": info.get("trade_data", {}).get("aum", ""),
+                "name": info.get("longName") or info.get("shortName") or "",
+                "category": category,
+                "expense_ratio": info.get("netExpenseRatio") or info.get("annualReportExpenseRatio") or "",
+                "aum": info.get("totalAssets") or "",
             })
         except Exception:
-            # ETFDB scraping can fail for individual tickers; skip and keep going
             continue
 
     ETF_CACHE.clear()
