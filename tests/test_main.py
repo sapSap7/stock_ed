@@ -23,38 +23,51 @@ def client():
 
 
 @pytest.fixture(autouse=True)
-def sample_caches():
-    """Populate the in-memory caches directly, bypassing the real startup scrape."""
-    main.ETF_CACHE.clear()
-    main.ETF_CACHE.extend([
-        {"ticker": "VNQ", "name": "Vanguard Real Estate ETF", "category": "Real Estate", "expense_ratio": "0.13%", "aum": "$39,503.2 M"},
-        {"ticker": "QQQ", "name": "Invesco QQQ Trust", "category": "Large Cap Growth Equities", "expense_ratio": "0.20%", "aum": "$300,000 M"},
-    ])
-    main.STOCK_CACHE.clear()
-    main.STOCK_CACHE.extend([
-        {"ticker": "AAPL", "name": "Apple Inc.", "sector": "Information Technology", "sub_industry": "Technology Hardware"},
-        {"ticker": "JPM", "name": "JPMorgan Chase", "sector": "Financials", "sub_industry": "Diversified Banks"},
-    ])
-    yield
-    main.ETF_CACHE.clear()
-    main.STOCK_CACHE.clear()
-
-
-@pytest.fixture(autouse=True)
 def clean_test_db():
-    """Ensure tables exist, then clean up any test users afterward (their
-    favourites cascade-delete with them). Tests run against the real Postgres
-    DB from DATABASE_URL — every test google_sub below is prefixed 'test-' so
-    this one DELETE clears everything a test could have created.
+    """Ensure tables exist, then clean up any test users/etfs afterward
+    (users' favourites cascade-delete with them). Tests run against the real
+    Postgres DB from DATABASE_URL — every test google_sub and etf ticker
+    below is prefixed 'test-'/'TEST' so these DELETEs never touch real data.
     """
     main.init_db()
     yield
     conn = main.get_db()
     cur = conn.cursor()
     cur.execute("DELETE FROM users WHERE google_sub LIKE 'test-%'")
+    cur.execute("DELETE FROM etfs WHERE ticker LIKE 'TEST%'")
     conn.commit()
     cur.close()
     conn.close()
+
+
+@pytest.fixture(autouse=True)
+def sample_data(clean_test_db):
+    """Insert sample ETF rows into Postgres and populate the in-memory stock
+    cache directly, bypassing the real scrapes. ETF categories are prefixed
+    so filter/category tests can't collide with real production data.
+    """
+    conn = main.get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO etfs (ticker, name, category, expense_ratio, aum, updated_at)
+        VALUES
+            ('TESTVNQ', 'Vanguard Real Estate ETF', 'Test Real Estate', '0.13%', '$39,503.2 M', '2024-01-01T00:00:00+00:00'),
+            ('TESTQQQ', 'Invesco QQQ Trust', 'Test Large Cap Growth', '0.20%', '$300,000 M', '2024-01-01T00:00:00+00:00')
+        ON CONFLICT (ticker) DO NOTHING
+        """
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    main.STOCK_CACHE.clear()
+    main.STOCK_CACHE.extend([
+        {"ticker": "AAPL", "name": "Apple Inc.", "sector": "Information Technology", "sub_industry": "Technology Hardware"},
+        {"ticker": "JPM", "name": "JPMorgan Chase", "sector": "Financials", "sub_industry": "Diversified Banks"},
+    ])
+    yield
+    main.STOCK_CACHE.clear()
 
 
 @pytest.fixture
@@ -79,14 +92,16 @@ def auth_headers(clean_test_db):
 def test_get_etfs_returns_all(client):
     response = client.get("/etfs")
     assert response.status_code == 200
-    assert len(response.json()) == 2
+    tickers = [e["ticker"] for e in response.json()]
+    assert "TESTVNQ" in tickers
+    assert "TESTQQQ" in tickers
 
 
 def test_get_etfs_filters_by_category_case_insensitive(client):
-    response = client.get("/etfs", params={"category": "real estate"})
+    response = client.get("/etfs", params={"category": "test real estate"})
     assert response.status_code == 200
     tickers = [e["ticker"] for e in response.json()]
-    assert tickers == ["VNQ"]
+    assert tickers == ["TESTVNQ"]
 
 
 def test_get_stocks_filters_by_sector(client):
@@ -100,7 +115,8 @@ def test_get_categories(client):
     response = client.get("/categories")
     assert response.status_code == 200
     data = response.json()
-    assert data["etf_categories"] == ["Large Cap Growth Equities", "Real Estate"]
+    assert "Test Large Cap Growth" in data["etf_categories"]
+    assert "Test Real Estate" in data["etf_categories"]
     assert data["stock_sectors"] == ["Financials", "Information Technology"]
 
 

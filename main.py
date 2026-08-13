@@ -4,18 +4,21 @@ main.py
 Consolidated FastAPI backend for the stock & ETF tracker.
 
 Data sources:
-- pyetfdb_scraper: just the ETF ticker list (load_etfs()) — per-ETF detail
-  pages on etfdb.com are blocked by Cloudflare from cloud hosting IPs, so
-  they're not used
-- Wikipedia's S&P 500 table (via pandas.read_html): stock list with each company's
-  GICS sector/sub-industry already labeled, no per-ticker lookup needed
-- yfinance: live price history + detailed per-ticker info (category, name,
-  expense ratio, AUM) for both stocks and ETFs
+- ETFs: read from the `etfs` table in Postgres. That table is populated by
+  the separate populate_etfs.py script (run manually, not by this app) —
+  see that file for why: etfdb.com blocks cloud hosting IPs, and scraping
+  yfinance for every ETF on every boot risks tripping its rate limiter.
+- Stocks: Wikipedia's S&P 500 table (via pandas.read_html), scraped once at
+  startup in a background thread — fast and not rate-limited.
+- yfinance: live price history + detailed per-ticker info for any ticker,
+  fetched fresh on each /price and /info request (never cached).
 
 How to run:
 1. Activate the venv, then: pip install -r requirements.txt
-2. uvicorn main:app --reload --host 0.0.0.0 --port 8000
-3. Interactive docs at http://localhost:8000/docs
+2. Populate the etfs table (once, or whenever you want to refresh it):
+   python populate_etfs.py
+3. uvicorn main:app --reload --host 0.0.0.0 --port 8000
+4. Interactive docs at http://localhost:8000/docs
 
 Endpoints:
 - GET /etfs?category=...        -> list ETFs, optionally filtered by category
@@ -34,12 +37,7 @@ Auth: requires GOOGLE_CLIENT_ID (from Google Cloud Console) and JWT_SECRET
 (any random string) set in .env.
 
 Database: requires DATABASE_URL (a Postgres connection string, e.g. from
-Neon) set in .env. Used for users/favourites.
-
-Caveat: fetching yfinance data for every ETF at startup can take a while
-(there are thousands of ETFs, one request each). ETF_SCRAPE_LIMIT below
-caps it; this population now runs in a background thread so it doesn't
-block the app from accepting requests while it runs.
+Neon) set in .env. Used for users/favourites/etfs.
 """
 
 import asyncio
@@ -56,7 +54,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token as google_id_token
 from pydantic import BaseModel
-from pyetfdb_scraper.etf import load_etfs
 import yfinance as yf
 import pandas as pd
 import uvicorn
@@ -90,10 +87,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ETF_SCRAPE_LIMIT = int(os.getenv("ETF_SCRAPE_LIMIT", "200"))
-
-# In-memory caches populated at startup
-ETF_CACHE = []
+# Stock list is populated at startup from Wikipedia (fast, not rate-limited).
+# ETFs are NOT scraped here — see populate_etfs.py; the /etfs table in
+# Postgres is populated by that standalone script, run manually, and this
+# app just reads from it.
 STOCK_CACHE = []
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -131,46 +128,24 @@ def init_db():
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS etfs (
+            ticker TEXT PRIMARY KEY,
+            name TEXT,
+            category TEXT NOT NULL,
+            expense_ratio TEXT,
+            aum TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
     cur.close()
     conn.close()
 
 
 init_db()
-
-
-def load_etf_cache():
-    # Ticker list comes from ETFDB (pyetfdb_scraper), which is fine — but
-    # per-ETF detail pages on etfdb.com are blocked by Cloudflare for cloud
-    # hosting IPs (works locally, 403s on Render/etc). yfinance works from
-    # both, so it's used for the actual category/name/expense-ratio data.
-    print("Startup: loading ETF ticker list...")
-    try:
-        tickers = load_etfs()
-    except Exception as e:
-        print("Error loading ETF list:", e)
-        return
-
-    found = []
-    for t in tickers[:ETF_SCRAPE_LIMIT]:
-        try:
-            info = yf.Ticker(t).info
-            category = info.get("category")
-            if not category:
-                continue
-            found.append({
-                "ticker": t,
-                "name": info.get("longName") or info.get("shortName") or "",
-                "category": category,
-                "expense_ratio": info.get("netExpenseRatio") or info.get("annualReportExpenseRatio") or "",
-                "aum": info.get("totalAssets") or "",
-            })
-        except Exception:
-            continue
-
-    ETF_CACHE.clear()
-    ETF_CACHE.extend(sorted(found, key=lambda x: x["ticker"]))
-    print(f"Startup: loaded {len(ETF_CACHE)} ETFs.")
 
 
 def load_stock_cache():
@@ -202,25 +177,27 @@ def load_stock_cache():
     print(f"Startup: loaded {len(STOCK_CACHE)} stocks.")
 
 
-def populate_caches():
-    load_etf_cache()
-    load_stock_cache()
-
-
 @app.on_event("startup")
 async def on_startup():
-    # Run the scrape in a background thread instead of awaiting it here.
-    # Blocking startup on this would keep the port from opening in time for
-    # host platforms (e.g. Render) that expect the process to bind quickly.
-    asyncio.create_task(asyncio.to_thread(populate_caches))
+    # Run in a background thread instead of awaiting it here. Blocking
+    # startup on this would keep the port from opening in time for host
+    # platforms (e.g. Render) that expect the process to bind quickly.
+    asyncio.create_task(asyncio.to_thread(load_stock_cache))
 
 
 @app.get("/etfs")
 async def get_etfs(category: str | None = None):
-    """Return cached ETFs, optionally filtered by category (case-insensitive)."""
+    """Return ETFs from the etfs table (populated by populate_etfs.py), optionally filtered by category."""
+    conn = get_db()
+    cur = conn.cursor()
     if category:
-        return [e for e in ETF_CACHE if e["category"].lower() == category.lower()]
-    return ETF_CACHE
+        cur.execute("SELECT * FROM etfs WHERE LOWER(category) = LOWER(%s) ORDER BY ticker", (category,))
+    else:
+        cur.execute("SELECT * FROM etfs ORDER BY ticker")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [dict(row) for row in rows]
 
 
 @app.get("/stocks")
@@ -234,7 +211,12 @@ async def get_stocks(sector: str | None = None):
 @app.get("/categories")
 async def get_categories():
     """Return the distinct ETF categories and stock sectors available, for a filter dropdown."""
-    etf_categories = sorted({e["category"] for e in ETF_CACHE if e["category"]})
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT category FROM etfs ORDER BY category")
+    etf_categories = [row["category"] for row in cur.fetchall()]
+    cur.close()
+    conn.close()
     stock_sectors = sorted({s["sector"] for s in STOCK_CACHE if s["sector"]})
     return {"etf_categories": etf_categories, "stock_sectors": stock_sectors}
 
