@@ -34,12 +34,33 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 DELAY_SECONDS = 0.5
 
 
+def connect():
+    return psycopg2.connect(DATABASE_URL)
+
+
+def save_etf(conn, ticker, name, category, expense_ratio, aum):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO etfs (ticker, name, category, expense_ratio, aum, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (ticker)
+        DO UPDATE SET name = EXCLUDED.name, category = EXCLUDED.category,
+                      expense_ratio = EXCLUDED.expense_ratio, aum = EXCLUDED.aum,
+                      updated_at = EXCLUDED.updated_at
+        """,
+        (ticker, name, category, expense_ratio, aum, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    cur.close()
+
+
 def main():
     limit = int(sys.argv[1]) if len(sys.argv) > 1 else 300
     tickers = load_etfs()[:limit]
     print(f"Fetching data for {len(tickers)} ETFs from yfinance (~{limit * DELAY_SECONDS / 60:.1f} min)...")
 
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = connect()
     cur = conn.cursor()
     cur.execute(
         """
@@ -54,6 +75,7 @@ def main():
         """
     )
     conn.commit()
+    cur.close()
 
     saved = 0
     for i, ticker in enumerate(tickers, start=1):
@@ -62,33 +84,38 @@ def main():
             category = info.get("category")
             if not category:
                 print(f"[{i}/{len(tickers)}] {ticker}: skipped (no category)")
+                time.sleep(DELAY_SECONDS)
                 continue
-            cur.execute(
-                """
-                INSERT INTO etfs (ticker, name, category, expense_ratio, aum, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (ticker)
-                DO UPDATE SET name = EXCLUDED.name, category = EXCLUDED.category,
-                              expense_ratio = EXCLUDED.expense_ratio, aum = EXCLUDED.aum,
-                              updated_at = EXCLUDED.updated_at
-                """,
-                (
-                    ticker,
-                    info.get("longName") or info.get("shortName") or "",
-                    category,
-                    info.get("netExpenseRatio") or info.get("annualReportExpenseRatio") or "",
-                    info.get("totalAssets") or "",
-                    datetime.now(timezone.utc).isoformat(),
-                ),
-            )
-            conn.commit()
+            name = info.get("longName") or info.get("shortName") or ""
+            expense_ratio = info.get("netExpenseRatio") or info.get("annualReportExpenseRatio") or ""
+            aum = info.get("totalAssets") or ""
+        except Exception as e:
+            print(f"[{i}/{len(tickers)}] {ticker}: skipped, yfinance error ({e})")
+            time.sleep(DELAY_SECONDS)
+            continue
+
+        try:
+            save_etf(conn, ticker, name, category, expense_ratio, aum)
             saved += 1
             print(f"[{i}/{len(tickers)}] {ticker}: {category}")
         except Exception as e:
-            print(f"[{i}/{len(tickers)}] {ticker}: skipped ({e})")
+            # The Neon connection can drop mid-run (idle timeout, network
+            # blip); reconnect once and retry this ticker before giving up.
+            print(f"[{i}/{len(tickers)}] {ticker}: DB error, reconnecting ({e})")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = connect()
+            try:
+                save_etf(conn, ticker, name, category, expense_ratio, aum)
+                saved += 1
+                print(f"[{i}/{len(tickers)}] {ticker}: {category} (saved after reconnect)")
+            except Exception as e2:
+                print(f"[{i}/{len(tickers)}] {ticker}: skipped, retry failed ({e2})")
+
         time.sleep(DELAY_SECONDS)
 
-    cur.close()
     conn.close()
     print(f"Done. Saved {saved} ETFs.")
 
